@@ -98,21 +98,26 @@ preset_name:
 
 ```
 SUBCOMMANDS:
-  listen              Listen for messages
-  send                Send a message
+  listen                    Listen for messages
+  send                      Send a message
 
-OPTIONS:
-  -p, --preset <NAME>  Use preset from config
-  -m, --message <M>    Command template or message
-  -a, --auth <A>       Authentication token
+GLOBAL OPTIONS:
+  -c, --config <FILE>       Config file path (default: ~/.config/crier.yml)
+  -h, --help                Print help
+  -V, --version             Print version
+
+COMMON OPTIONS:
+  -p, --preset <NAME>       Use preset from config file
+  -m, --message <MESSAGE>   Command template (listen) or message (send)
+  -a, --auth <AUTH>         Authentication token
 
 MQTT MODE:
-  --relay <BROKER>     MQTT broker address
-  --port <PORT>        Broker port (default: 1883)
-  -t, --topic <T>      MQTT topic
+  --relay <BROKER>          MQTT broker address (e.g., test.mosquitto.org)
+  --port <PORT>             MQTT broker port (default: 1883)
+  -t, --topic <TOPIC>       MQTT topic
 
 TCP MODE:
-  <ADDR>               Bind/target address
+  <ADDR>                    Bind address (listen) or target address (send)
 ```
 
 ## License
