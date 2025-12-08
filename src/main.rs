@@ -1,54 +1,203 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::time::Duration;
 
 /// Crier - Simple push notification tool
-///
-/// Start listener first, then send messages from anywhere.
 #[derive(Parser, Debug)]
 #[command(name = "crier", version, about)]
-#[command(group(
-    clap::ArgGroup::new("mode")
-        .required(true)
-        .args(["listen", "send"]),
-))]
 #[command(after_help = "EXAMPLES:
-  Listen: crier --listen 0.0.0.0:5555 -m 'notify-send \"Alert\" \"{}\"'
-  Send:   crier --send 192.168.1.10:5555 -m 'Build done!'")]
+  # TCP mode
+  crier listen 0.0.0.0:5555 -m 'notify-send \"Status\" \"{}\"'
+  crier send 192.168.1.10:5555 -m 'Build done!'
+
+  # MQTT mode
+  crier listen --relay test.mosquitto.org --port 1883 -t mybuilds -m 'notify-send \"Status\" \"{}\"'
+  crier send --relay test.mosquitto.org --port 1883 -t mybuilds -m 'Build done!'")]
 struct Args {
-    /// Listen mode: bind address (e.g., 0.0.0.0:5555)
-    #[arg(long, value_name = "ADDR")]
-    listen: Option<String>,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Send mode: target address (e.g., 192.168.1.10:5555)
-    #[arg(long, value_name = "ADDR")]
-    send: Option<String>,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Listen for messages
+    Listen {
+        /// Direct mode: bind address (e.g., 0.0.0.0:5555)
+        #[arg(value_name = "ADDR")]
+        addr: Option<String>,
 
-    /// Listen: command template (use {} as placeholder)
-    /// Send: message to send
-    #[arg(long, short)]
-    message: String,
+        /// Relay mode: MQTT broker (e.g., test.mosquitto.org)
+        #[arg(long, value_name = "BROKER")]
+        relay: Option<String>,
 
-    /// Optional authentication token
-    #[arg(long, short)]
-    auth: Option<String>,
+        /// MQTT broker port (default: 1883)
+        #[arg(long, default_value = "1883")]
+        port: u16,
+
+        /// Topic for relay mode
+        #[arg(long, short = 't', value_name = "TOPIC")]
+        topic: Option<String>,
+
+        /// Command to run (use {} as message placeholder)
+        #[arg(long, short)]
+        message: String,
+
+        /// Authentication token (direct mode only)
+        #[arg(long, short)]
+        auth: Option<String>,
+    },
+
+    /// Send a message
+    Send {
+        /// Direct mode: target address (e.g., 192.168.1.10:5555)
+        #[arg(value_name = "ADDR")]
+        addr: Option<String>,
+
+        /// Relay mode: MQTT broker (e.g., test.mosquitto.org)
+        #[arg(long, value_name = "BROKER")]
+        relay: Option<String>,
+
+        /// MQTT broker port (default: 1883)
+        #[arg(long, default_value = "1883")]
+        port: u16,
+
+        /// Topic for relay mode
+        #[arg(long, short = 't', value_name = "TOPIC")]
+        topic: Option<String>,
+
+        /// Message to send
+        #[arg(long, short)]
+        message: String,
+
+        /// Authentication token (direct mode only)
+        #[arg(long, short)]
+        auth: Option<String>,
+    },
 }
 
 fn main() {
     let args = Args::parse();
 
-    if let Some(addr) = args.listen {
-        listen(&addr, &args.message, args.auth.as_deref());
-    } else if let Some(addr) = args.send {
-        send(&addr, &args.message, args.auth.as_deref());
-    } else {
-        unreachable!("Clap ensures listen or send is present");
+    match args.command {
+        Commands::Listen { addr, relay, port, topic, message, auth } => {
+            if let Some(broker) = relay {
+                let topic = topic.unwrap_or_else(|| {
+                    eprintln!("Error: --topic is required with --relay");
+                    std::process::exit(1);
+                });
+                relay_listen(&broker, port, &topic, &message, auth.as_deref());
+            } else if let Some(addr) = addr {
+                direct_listen(&addr, &message, auth.as_deref());
+            } else {
+                eprintln!("Error: Provide address or --relay");
+                std::process::exit(1);
+            }
+        }
+        Commands::Send { addr, relay, port, topic, message, auth } => {
+            if let Some(broker) = relay {
+                let topic = topic.unwrap_or_else(|| {
+                    eprintln!("Error: --topic is required with --relay");
+                    std::process::exit(1);
+                });
+                relay_send(&broker, port, &topic, &message, auth.as_deref());
+            } else if let Some(addr) = addr {
+                direct_send(&addr, &message, auth.as_deref());
+            } else {
+                eprintln!("Error: Provide address or --relay");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-/// Listen for incoming messages
-fn listen(addr: &str, cmd_template: &str, auth: Option<&str>) {
+// ============= RELAY MODE (MQTT) =============
+
+fn relay_listen(broker: &str, port: u16, topic: &str, cmd_template: &str, auth: Option<&str>) {
+    let mut opts = MqttOptions::new("crier-listener", broker, port);
+    opts.set_keep_alive(Duration::from_secs(60));
+
+    let (client, mut connection) = Client::new(opts, 10);
+    client.subscribe(topic, QoS::AtLeastOnce).unwrap();
+
+    println!("Connected to: {}", broker);
+    println!("Topic: {}", topic);
+    println!("Command: {}", cmd_template);
+    if auth.is_some() {
+        println!("Auth: enabled");
+    }
+    println!("Waiting for messages...\n");
+
+    for event in connection.iter().flatten() {
+        if let Event::Incoming(Packet::Publish(msg)) = event {
+            let payload = String::from_utf8_lossy(&msg.payload);
+            
+            // Check auth if required
+            let message = if let Some(expected) = auth {
+                if let Some(stripped) = payload.strip_prefix(&format!("AUTH:{}:", expected)) {
+                    stripped.to_string()
+                } else {
+                    eprintln!("Auth failed, ignoring message");
+                    continue;
+                }
+            } else {
+                payload.to_string()
+            };
+            
+            println!("Received: {}", message);
+            let cmd = cmd_template.replace("{}", &message);
+            run_command(&cmd);
+        }
+    }
+}
+
+fn relay_send(broker: &str, port: u16, topic: &str, message: &str, auth: Option<&str>) {
+    let mut opts = MqttOptions::new("crier-sender", broker, port);
+    opts.set_keep_alive(Duration::from_secs(5));
+
+    let (client, mut connection) = Client::new(opts, 10);
+
+    // Prepend auth to message if provided
+    let payload = match auth {
+        Some(a) => format!("AUTH:{}:{}", a, message),
+        None => message.to_string(),
+    };
+
+    client
+        .publish(topic, QoS::AtMostOnce, false, payload.as_bytes())
+        .unwrap();
+
+    // Poll connection briefly to actually send the message
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    
+    for event in connection.iter() {
+        if start.elapsed() > timeout {
+            eprintln!("Timeout waiting for broker");
+            std::process::exit(1);
+        }
+        match event {
+            Ok(Event::Outgoing(rumqttc::Outgoing::Publish(_))) => {
+                println!("Sent via {}: {}", broker, message);
+                return;
+            }
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                // Connected, continue polling
+            }
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ============= DIRECT MODE (TCP) =============
+
+fn direct_listen(addr: &str, cmd_template: &str, auth: Option<&str>) {
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
         eprintln!("Failed to bind {}: {}", addr, e);
         std::process::exit(1);
@@ -65,11 +214,10 @@ fn listen(addr: &str, cmd_template: &str, auth: Option<&str>) {
         match stream {
             Ok(mut stream) => {
                 let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                
+
                 let reader = BufReader::new(&stream);
                 let mut lines = reader.lines();
 
-                // Check auth if required
                 if let Some(expected_auth) = auth {
                     match lines.next() {
                         Some(Ok(line)) if line == format!("AUTH:{}", expected_auth) => {}
@@ -81,14 +229,10 @@ fn listen(addr: &str, cmd_template: &str, auth: Option<&str>) {
                     }
                 }
 
-                // Read message
                 if let Some(Ok(message)) = lines.next() {
                     println!("[{}] {}", peer, message);
-                    
-                    // Execute command with message
                     let cmd = cmd_template.replace("{}", &message);
                     run_command(&cmd);
-                    
                     let _ = stream.write_all(b"OK\n");
                 }
             }
@@ -97,22 +241,18 @@ fn listen(addr: &str, cmd_template: &str, auth: Option<&str>) {
     }
 }
 
-/// Send a message
-fn send(addr: &str, message: &str, auth: Option<&str>) {
+fn direct_send(addr: &str, message: &str, auth: Option<&str>) {
     let mut stream = TcpStream::connect(addr).unwrap_or_else(|e| {
         eprintln!("Failed to connect to {}: {}", addr, e);
         std::process::exit(1);
     });
 
-    // Send auth if provided
     if let Some(auth_token) = auth {
         writeln!(stream, "AUTH:{}", auth_token).unwrap();
     }
 
-    // Send message
     writeln!(stream, "{}", message).unwrap();
 
-    // Wait for response
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
     if reader.read_line(&mut response).is_ok() {

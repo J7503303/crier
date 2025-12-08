@@ -6,3 +6,4 @@ description = "Simple push notification tool"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+rumqttc = "0.25"
