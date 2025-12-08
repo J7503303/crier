@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -14,9 +18,17 @@ use std::time::Duration;
   crier send 192.168.1.10:5555 -m 'Build done!'
 
   # MQTT mode
-  crier listen --relay test.mosquitto.org --port 1883 -t mybuilds -m 'notify-send \"Status\" \"{}\"'
-  crier send --relay test.mosquitto.org --port 1883 -t mybuilds -m 'Build done!'")]
+  crier listen --relay test.mosquitto.org -t mybuilds -m 'notify-send \"Status\" \"{}\"'
+  crier send --relay test.mosquitto.org -t mybuilds -m 'Build done!'
+
+  # Using presets from ~/.config/crier.yml
+  crier listen -p mypreset
+  crier send -p mypreset -m 'Build done!'")]
 struct Args {
+    /// Config file path (default: ~/.config/crier.yml)
+    #[arg(long, short = 'c', value_name = "FILE", global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -25,6 +37,10 @@ struct Args {
 enum Commands {
     /// Listen for messages
     Listen {
+        /// Use preset from config file
+        #[arg(long, short = 'p', value_name = "NAME")]
+        preset: Option<String>,
+
         /// Direct mode: bind address (e.g., 0.0.0.0:5555)
         #[arg(value_name = "ADDR")]
         addr: Option<String>,
@@ -43,15 +59,19 @@ enum Commands {
 
         /// Command to run (use {} as message placeholder)
         #[arg(long, short)]
-        message: String,
+        message: Option<String>,
 
-        /// Authentication token (direct mode only)
+        /// Authentication token
         #[arg(long, short)]
         auth: Option<String>,
     },
 
     /// Send a message
     Send {
+        /// Use preset from config file
+        #[arg(long, short = 'p', value_name = "NAME")]
+        preset: Option<String>,
+
         /// Direct mode: target address (e.g., 192.168.1.10:5555)
         #[arg(value_name = "ADDR")]
         addr: Option<String>,
@@ -70,19 +90,86 @@ enum Commands {
 
         /// Message to send
         #[arg(long, short)]
-        message: String,
+        message: Option<String>,
 
-        /// Authentication token (direct mode only)
+        /// Authentication token
         #[arg(long, short)]
         auth: Option<String>,
     },
 }
 
+// ============= CONFIG =============
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct Preset {
+    addr: Option<String>,
+    relay: Option<String>,
+    port: Option<u16>,
+    topic: Option<String>,
+    message: Option<String>,
+    auth: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    #[serde(flatten)]
+    presets: HashMap<String, Preset>,
+}
+
+fn config_path(custom: Option<&PathBuf>) -> PathBuf {
+    custom.cloned().unwrap_or_else(|| {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("crier.yml")
+    })
+}
+
+fn load_config(custom_path: Option<&PathBuf>) -> Config {
+    let path = config_path(custom_path);
+    if path.exists() {
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_yaml::from_str(&content).unwrap_or_default(),
+            Err(_) => Config::default(),
+        }
+    } else {
+        Config::default()
+    }
+}
+
+fn get_preset(name: &str, custom_path: Option<&PathBuf>) -> Preset {
+    let config = load_config(custom_path);
+    let path = config_path(custom_path);
+    config.presets.get(name).cloned().unwrap_or_else(|| {
+        eprintln!("Error: Preset '{}' not found in {:?}", name, path);
+        eprintln!("Available presets: {:?}", config.presets.keys().collect::<Vec<_>>());
+        std::process::exit(1);
+    })
+}
+
+// ============= MAIN =============
+
 fn main() {
     let args = Args::parse();
+    let config_path = args.config.as_ref();
 
     match args.command {
-        Commands::Listen { addr, relay, port, topic, message, auth } => {
+        Commands::Listen { preset, addr, relay, port, topic, message, auth } => {
+            // Load preset if specified
+            let p = preset.as_ref().map(|n| get_preset(n, config_path)).unwrap_or_default();
+            
+            // CLI overrides preset
+            let addr = addr.or(p.addr);
+            let relay = relay.or(p.relay);
+            let port = if port != 1883 { port } else { p.port.unwrap_or(1883) };
+            let topic = topic.or(p.topic);
+            let message = message.or(p.message);
+            let auth = auth.or(p.auth);
+
+            let message = message.unwrap_or_else(|| {
+                eprintln!("Error: --message is required");
+                std::process::exit(1);
+            });
+
             if let Some(broker) = relay {
                 let topic = topic.unwrap_or_else(|| {
                     eprintln!("Error: --topic is required with --relay");
@@ -92,11 +179,27 @@ fn main() {
             } else if let Some(addr) = addr {
                 direct_listen(&addr, &message, auth.as_deref());
             } else {
-                eprintln!("Error: Provide address or --relay");
+                eprintln!("Error: Provide address, --relay, or --preset");
                 std::process::exit(1);
             }
         }
-        Commands::Send { addr, relay, port, topic, message, auth } => {
+        Commands::Send { preset, addr, relay, port, topic, message, auth } => {
+            // Load preset if specified
+            let p = preset.as_ref().map(|n| get_preset(n, config_path)).unwrap_or_default();
+            
+            // CLI overrides preset
+            let addr = addr.or(p.addr);
+            let relay = relay.or(p.relay);
+            let port = if port != 1883 { port } else { p.port.unwrap_or(1883) };
+            let topic = topic.or(p.topic);
+            let message = message.or(p.message);
+            let auth = auth.or(p.auth);
+
+            let message = message.unwrap_or_else(|| {
+                eprintln!("Error: --message is required");
+                std::process::exit(1);
+            });
+
             if let Some(broker) = relay {
                 let topic = topic.unwrap_or_else(|| {
                     eprintln!("Error: --topic is required with --relay");
@@ -106,7 +209,7 @@ fn main() {
             } else if let Some(addr) = addr {
                 direct_send(&addr, &message, auth.as_deref());
             } else {
-                eprintln!("Error: Provide address or --relay");
+                eprintln!("Error: Provide address, --relay, or --preset");
                 std::process::exit(1);
             }
         }
