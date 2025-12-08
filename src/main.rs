@@ -12,25 +12,17 @@ use std::time::Duration;
 /// Crier - Simple push notification tool
 #[derive(Parser, Debug)]
 #[command(name = "crier", version, about)]
-#[command(after_help = "EXAMPLES:
-  # TCP mode
-  crier listen 0.0.0.0:5555 -m 'notify-send \"Status\" \"{}\"'
-  crier send 192.168.1.10:5555 -m 'Build done!'
-
-  # MQTT mode
-  crier listen --relay test.mosquitto.org -t mybuilds -m 'notify-send \"Status\" \"{}\"'
-  crier send --relay test.mosquitto.org -t mybuilds -m 'Build done!'
-
-  # Using presets from ~/.config/crier.yml
-  crier listen -p mypreset
-  crier send -p mypreset -m 'Build done!'")]
 struct Args {
     /// Config file path (default: ~/.config/crier.yml)
     #[arg(long, short = 'c', value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
+    /// Show usage examples
+    #[arg(long, short = 'e', global = true)]
+    examples: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -146,13 +138,45 @@ fn get_preset(name: &str, custom_path: Option<&PathBuf>) -> Preset {
     })
 }
 
+fn print_examples() {
+    println!("EXAMPLES:");
+    println!();
+    println!("  # TCP mode");
+    println!("  crier listen 0.0.0.0:5555 -m 'notify-send \"Status\" \"{{}}\"'");
+    println!("  crier send 192.168.1.10:5555 -m 'Build done!'");
+    println!();
+    println!("  # MQTT mode");
+    println!("  crier listen --relay test.mosquitto.org -t mybuilds -m 'notify-send \"Status\" \"{{}}\"'");
+    println!("  crier send --relay test.mosquitto.org -t mybuilds -m 'Build done!'");
+    println!();
+    println!("  # Using presets from ~/.config/crier.yml");
+    println!("  crier listen -p mypreset");
+    println!("  crier send -p mypreset -m 'Build done!'");
+    println!();
+    println!("  # Custom config file");
+    println!("  crier -c ./project.yml listen -p build");
+}
+
 // ============= MAIN =============
 
 fn main() {
     let args = Args::parse();
+    
+    // Show examples if requested
+    if args.examples {
+        print_examples();
+        return;
+    }
+
     let config_path = args.config.as_ref();
 
-    match args.command {
+    let command = args.command.unwrap_or_else(|| {
+        eprintln!("Error: A subcommand is required (listen or send)");
+        eprintln!("Try: crier --help");
+        std::process::exit(1);
+    });
+
+    match command {
         Commands::Listen { preset, addr, relay, port, topic, message, auth } => {
             // Load preset if specified
             let p = preset.as_ref().map(|n| get_preset(n, config_path)).unwrap_or_default();
